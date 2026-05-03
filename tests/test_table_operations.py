@@ -1,7 +1,8 @@
 """Tests for table_operations module."""
 
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, call
 
+import pandas as pd
 import pytest
 
 from docs_client import DocsClient
@@ -18,6 +19,8 @@ SAMPLE_SOURCE_ROWS = [
     {"Имя": "Bob", "Возраст": "21", "Группа": "102"},
     {"Имя": "Carol", "Возраст": "22", "Группа": "101"},
 ]
+
+SAMPLE_DF = pd.DataFrame(SAMPLE_SOURCE_ROWS)
 
 
 def _make_sheets_client(source_rows=None, sheet_names=None, existing_dest=None):
@@ -53,6 +56,7 @@ class TestTransferRows:
         transferred = to.transfer_rows(
             sc, "src_id", "SrcSheet", "dst_id", "DstSheet"
         )
+        assert isinstance(transferred, pd.DataFrame)
         assert len(transferred) == 3
         # Header should have been appended first (dest was empty)
         first_append = sc.append_rows.call_args_list[0]
@@ -67,6 +71,8 @@ class TestTransferRows:
             sc, "src_id", "SrcSheet", "dst_id", "DstSheet",
             column_map=col_map,
         )
+        assert isinstance(transferred, pd.DataFrame)
+        assert list(transferred.columns) == ["Name", "Group"]
         assert len(transferred) == 3
         # Check header written to dest
         first_append = sc.append_rows.call_args_list[0]
@@ -84,9 +90,9 @@ class TestTransferRows:
             sc, "src_id", "SrcSheet", "dst_id", "DstSheet",
             row_filter=lambda r: r["Группа"] == "101",
         )
+        assert isinstance(transferred, pd.DataFrame)
         assert len(transferred) == 2
-        names = [r["Имя"] for r in transferred]
-        assert names == ["Alice", "Carol"]
+        assert transferred["Имя"].tolist() == ["Alice", "Carol"]
 
     def test_no_rows_transferred_when_filter_excludes_all(self):
         sc = _make_sheets_client(source_rows=SAMPLE_SOURCE_ROWS)
@@ -94,7 +100,8 @@ class TestTransferRows:
             sc, "src_id", "SrcSheet", "dst_id", "DstSheet",
             row_filter=lambda r: False,
         )
-        assert transferred == []
+        assert isinstance(transferred, pd.DataFrame)
+        assert transferred.empty
         sc.append_rows.assert_not_called()
 
     def test_no_header_appended_when_dest_has_data(self):
@@ -117,10 +124,11 @@ class TestTransferRows:
         # Three rows → three delete_rows calls
         assert sc.delete_rows.call_count == 3
 
-    def test_empty_source_returns_empty(self):
+    def test_empty_source_returns_empty_dataframe(self):
         sc = _make_sheets_client(source_rows=[])
         result = to.transfer_rows(sc, "s", "S", "d", "D")
-        assert result == []
+        assert isinstance(result, pd.DataFrame)
+        assert result.empty
 
 
 # ---------------------------------------------------------------------------
@@ -130,21 +138,19 @@ class TestTransferRows:
 class TestBuildAuxiliaryTable:
     def test_clears_existing_sheet(self):
         sc = _make_sheets_client(sheet_names=["Existing"])
-        to.build_auxiliary_table(sc, "sid", "Existing", SAMPLE_SOURCE_ROWS)
+        to.build_auxiliary_table(sc, "sid", "Existing", SAMPLE_DF)
         sc.clear_range.assert_called_once_with("sid", "Existing")
         sc.add_sheet.assert_not_called()
 
     def test_creates_new_sheet(self):
         sc = _make_sheets_client(sheet_names=["Other"])
-        to.build_auxiliary_table(sc, "sid", "New", SAMPLE_SOURCE_ROWS)
+        to.build_auxiliary_table(sc, "sid", "New", SAMPLE_DF)
         sc.add_sheet.assert_called_once_with("sid", "New")
         sc.clear_range.assert_not_called()
 
     def test_writes_header_and_data(self):
         sc = _make_sheets_client(sheet_names=[])
-        to.build_auxiliary_table(
-            sc, "sid", "Sheet", SAMPLE_SOURCE_ROWS[:2]
-        )
+        to.build_auxiliary_table(sc, "sid", "Sheet", SAMPLE_DF.iloc[:2])
         sc.write_values.assert_called_once()
         written = sc.write_values.call_args.args[2]
         assert written[0] == ["Имя", "Возраст", "Группа"]  # header
@@ -154,7 +160,7 @@ class TestBuildAuxiliaryTable:
     def test_writes_with_column_map(self):
         sc = _make_sheets_client(sheet_names=[])
         to.build_auxiliary_table(
-            sc, "sid", "Sheet", SAMPLE_SOURCE_ROWS[:1],
+            sc, "sid", "Sheet", SAMPLE_DF.iloc[:1],
             column_map={"Имя": "Name", "Группа": "Group"},
         )
         written = sc.write_values.call_args.args[2]
@@ -163,7 +169,7 @@ class TestBuildAuxiliaryTable:
 
     def test_empty_source_data_does_not_write(self):
         sc = _make_sheets_client(sheet_names=[])
-        to.build_auxiliary_table(sc, "sid", "Sheet", [])
+        to.build_auxiliary_table(sc, "sid", "Sheet", pd.DataFrame())
         sc.write_values.assert_not_called()
 
 

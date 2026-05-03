@@ -1,7 +1,7 @@
 """
 Higher-level table operations built on top of SheetsClient and DocsClient.
 
-These helpers implement the workflows described in the problem statement:
+All internal data manipulation is performed with pandas DataFrames.
 
 * Transferring rows between spreadsheets / sheets (with optional column
   renaming and row filtering).
@@ -11,7 +11,9 @@ These helpers implement the workflows described in the problem statement:
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Callable
+
+import pandas as pd
 
 from docs_client import DocsClient
 from sheets_client import SheetsClient
@@ -24,13 +26,13 @@ def transfer_rows(
     dest_id: str,
     dest_sheet: str,
     column_map: dict[str, str] | None = None,
-    row_filter: Callable[[dict[str, Any]], bool] | None = None,
+    row_filter: Callable[[pd.Series], bool] | None = None,
     delete_from_source: bool = False,
-) -> list[dict[str, Any]]:
+) -> pd.DataFrame:
     """Transfer rows from one sheet to another, optionally renaming columns.
 
-    The function reads *source_sheet* from *source_id*, applies the optional
-    *row_filter*, renames columns according to *column_map*, and appends the
+    Reads *source_sheet* into a DataFrame, applies the optional *row_filter*,
+    renames / selects columns according to *column_map*, and appends the
     resulting rows to *dest_sheet* in *dest_id*.
 
     Parameters
@@ -50,8 +52,11 @@ def transfer_rows(
         Only the columns listed as keys are transferred; if *None*, all
         columns are transferred unchanged.
     row_filter:
-        Optional callable that receives a row dict and returns ``True`` if
-        the row should be transferred.
+        Optional callable that receives a row (``pd.Series``) and returns
+        ``True`` if the row should be transferred.  Applied via
+        ``df.apply(row_filter, axis=1)``; for very large sheets a
+        vectorized mask (e.g. ``df["col"] == value``) passed as a boolean
+        Series is more performant.
     delete_from_source:
         If ``True``, delete transferred rows from the source sheet after
         a successful write.  Row deletion is performed from the bottom to
@@ -59,67 +64,58 @@ def transfer_rows(
 
     Returns
     -------
-    list[dict[str, Any]]
-        The list of row dicts that were written to the destination.
+    pd.DataFrame
+        The rows that were written to the destination (with destination
+        column names).  Returns an empty DataFrame when nothing was
+        transferred.
     """
     source_rows = sheets_client.read_as_dicts(source_id, source_sheet)
+    df = pd.DataFrame(source_rows)
 
-    # Apply row filter
+    if df.empty:
+        return pd.DataFrame()
+
+    # Apply row filter and remember original (pre-filter) positional indices
     if row_filter is not None:
-        selected = [
-            (idx, row)
-            for idx, row in enumerate(source_rows)
-            if row_filter(row)
-        ]
+        mask = df.apply(row_filter, axis=1)
+        selected_df = df[mask]
+        selected_indices = df.index[mask].tolist()
     else:
-        selected = list(enumerate(source_rows))
+        selected_df = df
+        selected_indices = df.index.tolist()
 
-    if not selected:
-        return []
+    if selected_df.empty:
+        return pd.DataFrame()
 
-    # Build destination rows according to column_map
+    # Select and rename columns
     if column_map is not None:
-        dest_header = list(column_map.values())
-        dest_rows_values: list[list[Any]] = [
-            [row.get(src_col, "") for src_col in column_map]
-            for _, row in selected
-        ]
+        dest_df = selected_df[list(column_map.keys())].rename(columns=column_map)
     else:
-        # Use source headers unchanged; read them from the first source row
-        dest_header = list(source_rows[0].keys()) if source_rows else []
-        dest_rows_values = [
-            [row.get(col, "") for col in dest_header]
-            for _, row in selected
-        ]
+        dest_df = selected_df.copy()
 
-    # Check whether destination sheet is empty (needs header row)
+    # Write header row only when destination sheet is currently empty
     existing = sheets_client.read_values(dest_id, dest_sheet)
     if not existing:
-        sheets_client.append_rows(dest_id, dest_sheet, [dest_header])
+        sheets_client.append_rows(dest_id, dest_sheet, [dest_df.columns.tolist()])
 
-    sheets_client.append_rows(dest_id, dest_sheet, dest_rows_values)
+    sheets_client.append_rows(dest_id, dest_sheet, dest_df.values.tolist())
 
-    transferred = [row for _, row in selected]
-
-    # Optionally delete from source (delete bottom-up to keep indices valid)
-    if delete_from_source and selected:
+    # Optionally delete from source (bottom-up to keep indices valid)
+    if delete_from_source:
         sheet_id = sheets_client.get_sheet_id(source_id, source_sheet)
-        # selected indices are data-row indices (0-based within source_rows);
-        # add 1 to account for the header row in the sheet.
-        source_indices = sorted([idx + 1 for idx, _ in selected], reverse=True)
-        for row_idx in source_indices:
-            sheets_client.delete_rows(
-                source_id, sheet_id, row_idx, row_idx + 1
-            )
+        # +1 because index 0 in source_rows corresponds to row 1 in the sheet
+        # (row 0 is the header).
+        for row_idx in sorted([idx + 1 for idx in selected_indices], reverse=True):
+            sheets_client.delete_rows(source_id, sheet_id, row_idx, row_idx + 1)
 
-    return transferred
+    return dest_df.reset_index(drop=True)
 
 
 def build_auxiliary_table(
     sheets_client: SheetsClient,
     spreadsheet_id: str,
     sheet_name: str,
-    source_data: list[dict[str, Any]],
+    source_data: pd.DataFrame,
     column_map: dict[str, str] | None = None,
 ) -> None:
     """Create (or overwrite) an auxiliary table inside an existing spreadsheet.
@@ -136,11 +132,11 @@ def build_auxiliary_table(
     sheet_name:
         Name of the sheet (tab) to create / overwrite.
     source_data:
-        List of row dicts to write.
+        DataFrame to write.  Pass an empty DataFrame to create an empty sheet.
     column_map:
-        Optional mapping ``{source_key: column_header}``.  Only the keys
-        listed are written.  If *None*, all keys from the first row are
-        used, with their original names as headers.
+        Optional mapping ``{source_column: output_column_header}``.  Only
+        the columns listed are written.  If *None*, all columns are written
+        with their original names.
     """
     existing_sheets = sheets_client.get_sheet_names(spreadsheet_id)
 
@@ -149,21 +145,16 @@ def build_auxiliary_table(
     else:
         sheets_client.add_sheet(spreadsheet_id, sheet_name)
 
-    if not source_data:
+    if source_data.empty:
         return
 
     if column_map is not None:
-        header = list(column_map.values())
-        rows: list[list[Any]] = [
-            [row.get(src_key, "") for src_key in column_map]
-            for row in source_data
-        ]
+        df = source_data[list(column_map.keys())].rename(columns=column_map)
     else:
-        header = list(source_data[0].keys())
-        rows = [[row.get(col, "") for col in header] for row in source_data]
+        df = source_data
 
     sheets_client.write_values(
-        spreadsheet_id, sheet_name, [header] + rows
+        spreadsheet_id, sheet_name, [df.columns.tolist()] + df.values.tolist()
     )
 
 
@@ -176,14 +167,13 @@ def generate_documents_from_table(
     folder_id: str,
     title_column: str,
     column_map: dict[str, str] | None = None,
-    row_filter: Callable[[dict[str, Any]], bool] | None = None,
+    row_filter: Callable[[pd.Series], bool] | None = None,
 ) -> list[str]:
     """Generate one Google Doc per row from a template document.
 
     For each selected row the template document is copied and then all
-    ``{{PLACEHOLDER}}`` strings (matching the destination column names from
-    *column_map*, e.g. ``{{ФИО}}``) are replaced with the corresponding
-    cell values.
+    ``{{PLACEHOLDER}}`` strings are replaced with the corresponding cell
+    values from the row.
 
     Parameters
     ----------
@@ -200,38 +190,42 @@ def generate_documents_from_table(
     folder_id:
         Drive folder ID where generated documents are saved.
     title_column:
-        The column whose value is used as the document title.  This is
-        the *source* column name (before any column mapping).
+        The source column whose value is used as the document title.
     column_map:
         Optional mapping ``{source_column: placeholder_text}``.
         Each source cell value replaces ``{{placeholder_text}}`` in the
-        copied document.  If *None*, every source column ``COL`` is
-        mapped to the placeholder ``{{COL}}``.
+        copied document.  If *None*, every source column ``COL`` maps to
+        ``{{COL}}``.
     row_filter:
-        Optional callable that receives a row dict and returns ``True``
-        when the row should produce a document.
+        Optional callable receiving a row (``pd.Series``) and returning
+        ``True`` when the row should produce a document.  Applied via
+        ``df.apply(row_filter, axis=1)``; for very large sheets a
+        vectorized boolean mask is more performant.
 
     Returns
     -------
     list[str]
-        IDs of the newly created documents (one per transferred row).
+        IDs of the newly created documents (one per row).
     """
-    rows = sheets_client.read_as_dicts(spreadsheet_id, sheet_name)
+    source_rows = sheets_client.read_as_dicts(spreadsheet_id, sheet_name)
+    df = pd.DataFrame(source_rows)
+
+    if df.empty:
+        return []
 
     if row_filter is not None:
-        rows = [row for row in rows if row_filter(row)]
+        df = df[df.apply(row_filter, axis=1)].reset_index(drop=True)
 
-    if not rows:
+    if df.empty:
         return []
 
     if column_map is None:
-        column_map = {col: col for col in rows[0]}
+        column_map = {col: col for col in df.columns}
 
     document_ids: list[str] = []
-    for row in rows:
-        doc_title = row.get(title_column, "Document")
+    for row in df.to_dict(orient="records"):
+        doc_title = str(row.get(title_column, "Document"))
         new_doc_id = docs_client.copy_template(template_id, doc_title, folder_id)
-
         replacements = {
             f"{{{{{placeholder}}}}}": str(row.get(src_col, ""))
             for src_col, placeholder in column_map.items()

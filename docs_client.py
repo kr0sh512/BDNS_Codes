@@ -40,13 +40,13 @@ class DocsClient:
             Title of the new document.
         folder_id:
             Optional Google Drive folder ID.  If provided, the document is
-            moved to that folder immediately after creation.
+            added to that folder immediately after creation.
         """
         doc = self._docs.documents().create(body={"title": title}).execute()
         document_id = doc["documentId"]
 
         if folder_id:
-            self._move_to_folder(document_id, folder_id)
+            self._add_to_folder(document_id, folder_id)
 
         return document_id
 
@@ -131,18 +131,16 @@ class DocsClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _move_to_folder(self, file_id: str, folder_id: str) -> None:
-        """Move *file_id* into *folder_id* using the Drive API."""
-        # Retrieve current parents so we can remove them
-        file_meta = (
-            self._drive.files()
-            .get(fileId=file_id, fields="parents")
-            .execute()
-        )
-        previous_parents = ",".join(file_meta.get("parents", []))
+    def _add_to_folder(self, file_id: str, folder_id: str) -> None:
+        """Add *file_id* to *folder_id* without removing any existing parents.
+
+        Using ``addParents`` alone means the file becomes accessible from
+        *folder_id* while remaining in any folder it already belongs to.
+        This is safe even when the folder contains other files — those files
+        are unaffected.
+        """
         self._drive.files().update(
             fileId=file_id,
             addParents=folder_id,
-            removeParents=previous_parents,
             fields="id, parents",
         ).execute()

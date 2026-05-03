@@ -18,15 +18,11 @@ class TestCreateDocument:
         doc_id = client.create_document("My Title")
         assert doc_id == "doc123"
 
-    def test_create_document_moves_to_folder(self):
+    def test_create_document_adds_to_folder(self):
         docs_svc = MagicMock()
         drive_svc = MagicMock()
         docs_svc.documents.return_value.create.return_value.execute.return_value = {
             "documentId": "doc123"
-        }
-        # Simulate Drive API calls for _move_to_folder
-        drive_svc.files.return_value.get.return_value.execute.return_value = {
-            "parents": ["old_folder"]
         }
         drive_svc.files.return_value.update.return_value.execute.return_value = {}
 
@@ -34,12 +30,12 @@ class TestCreateDocument:
         doc_id = client.create_document("My Title", folder_id="new_folder")
 
         assert doc_id == "doc123"
-        # Verify Drive update was called
         update_call = drive_svc.files.return_value.update
         update_call.assert_called_once()
         kwargs = update_call.call_args.kwargs
+        # Only adds the new parent; does NOT remove any existing parents
         assert kwargs["addParents"] == "new_folder"
-        assert kwargs["removeParents"] == "old_folder"
+        assert "removeParents" not in kwargs
 
     def test_create_document_no_folder(self):
         docs_svc = MagicMock()
