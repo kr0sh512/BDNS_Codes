@@ -209,6 +209,11 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# Google API credentials and environment config — must never be committed
+credentials.json
+token.json
+.env
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
